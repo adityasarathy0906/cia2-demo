@@ -53,3 +53,15 @@ jobs:
         run: |
           docker push adityacia2acr.azurecr.io/cia2-demo:${{ github.sha }}
           docker push adityacia2acr.azurecr.io/cia2-demo:latest
+
+        - name: Get AKS credentials
+          if: github.event_name != 'pull_request'
+          run: |
+            az aks get-credentials --resource-group cia2-rg --name cia2-aks --admin --overwrite-existing
+
+        - name: Deploy to AKS
+          if: github.event_name != 'pull_request'
+          run: |
+            kubectl apply -f k8s/
+            kubectl rollout status deployment/cia2-demo --timeout=180s
+
