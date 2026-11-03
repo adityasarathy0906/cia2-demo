@@ -1,0 +1,20 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cia2-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cia2-demo
+  template:
+    metadata:
+      labels:
+        app: cia2-demo
+    spec:
+      containers:
+        - name: cia2-demo
+          image: adityacia2acr.azurecr.io/cia2-demo:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
