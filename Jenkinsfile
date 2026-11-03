@@ -6,7 +6,9 @@ pipeline {
         timestamps()
         disableConcurrentBuilds()
     }
-
+           triggers {
+        pollSCM('H/2 * * * *')
+    }
     environment {
         // AZURE CLI
         AZ_CLI = 'C:\\Program Files\\Microsoft SDKs\\Azure\\CLI2\\wbin\\az.cmd'
