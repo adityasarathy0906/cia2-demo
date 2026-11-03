@@ -13,7 +13,6 @@ pipeline {
 
         // Docker Desktop
         DOCKER_EXE = 'C:\\Users\\acer\\AppData\\Local\\Programs\\DockerDesktop\\resources\\bin\\docker.exe'
-        DOCKER_DIR = 'C:\\Users\\acer\\AppData\\Local\\Programs\\DockerDesktop\\resources\\bin'
 
         // Kubernetes CLI
         KUBECTL_EXE = 'C:\\Users\\acer\\AppData\\Local\\Microsoft\\WinGet\\Packages\\Kubernetes.kubectl_Microsoft.Winget.Source_8wekyb3d8bbwe\\kubectl.exe'
@@ -65,13 +64,12 @@ pipeline {
         stage('Check Docker') {
             steps {
                 echo 'Checking Docker installation...'
-
                 bat '"%DOCKER_EXE%" --version'
                 bat '"%DOCKER_EXE%" info'
             }
         }
 
-        // STAGE 5: DOCKER IMAGE BUILD
+        // STAGE 5: BUILD DOCKER IMAGE
         stage('Build Docker Image') {
             steps {
                 script {
@@ -112,29 +110,27 @@ pipeline {
 
                     withEnv([
                         "KUBECONFIG=${env.WORKSPACE}\\.kube\\config",
-                        "DOCKER_CONFIG=${env.WORKSPACE}\\.docker-ci"
+                        "DOCKER_CONFIG=${env.WORKSPACE}\\.docker-ci",
+                        "AZURE_CONFIG_DIR=${env.WORKSPACE}\\.azure-ci"
                     ]) {
 
                         script {
-
                             try {
 
-                                // INITIALIZE ISOLATED DOCKER CONFIG
-                                echo 'Preparing isolated Docker configuration...'
+                                // INITIALIZE TEMPORARY CONFIGURATIONS
+                                echo 'Preparing isolated configurations...'
 
                                 bat '''
                                     @echo off
 
-                                    if exist "%DOCKER_CONFIG%" (
-                                        rmdir /s /q "%DOCKER_CONFIG%"
-                                    )
-
-                                    mkdir "%DOCKER_CONFIG%"
+                                    if not exist "%DOCKER_CONFIG%" mkdir "%DOCKER_CONFIG%"
+                                    if not exist "%AZURE_CONFIG_DIR%" mkdir "%AZURE_CONFIG_DIR%"
+                                    if not exist "%WORKSPACE%\\.kube" mkdir "%WORKSPACE%\\.kube"
 
                                     > "%DOCKER_CONFIG%\\config.json" echo {}
                                 '''
 
-                                // AZURE LOGIN
+                                // AZURE AUTHENTICATION
                                 echo 'Authenticating with Azure...'
 
                                 bat '''
@@ -157,54 +153,69 @@ pipeline {
 
                                 echo 'Azure authentication successful!'
 
-                                // ACR LOGIN
-                                echo 'Connecting to Azure Container Registry...'
+                                // ACR AUTHENTICATION USING EXPOSED TOKEN
+                                echo 'Obtaining ACR access token...'
+
+                                writeFile file: 'acr-login.ps1', text: '''
+$ErrorActionPreference = "Stop"
+
+$token = & $env:AZ_CLI acr login `
+    --name $env:ACR_NAME `
+    --expose-token `
+    --query accessToken `
+    --output tsv
+
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($token)) {
+    Write-Error "Could not obtain ACR access token."
+    exit 1
+}
+
+$token | & $env:DOCKER_EXE --config $env:DOCKER_CONFIG login `
+    $env:ACR_LOGIN_SERVER `
+    --username "00000000-0000-0000-0000-000000000000" `
+    --password-stdin
+
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "Docker registry login failed."
+    exit 1
+}
+
+Write-Output "ACR authentication successful."
+'''
 
                                 bat '''
                                     @echo off
 
-                                    set "PATH=%DOCKER_DIR%;%PATH%"
-
-                                    "%AZ_CLI%" acr login --name "%ACR_NAME%"
+                                    powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%WORKSPACE%\\acr-login.ps1"
 
                                     if errorlevel 1 exit /b 1
                                 '''
 
                                 echo 'ACR authentication successful!'
 
-                                // PUSH DOCKER IMAGE
+                                // PUSH VERSIONED IMAGE
                                 echo 'Pushing versioned Docker image to ACR...'
 
                                 bat '''
                                     @echo off
 
-                                    "%DOCKER_EXE%" push "%IMAGE_URI%"
+                                    "%DOCKER_EXE%" --config "%DOCKER_CONFIG%" push "%IMAGE_URI%"
 
                                     if errorlevel 1 exit /b 1
                                 '''
 
+                                // PUSH LATEST IMAGE
                                 echo 'Pushing latest Docker image to ACR...'
 
                                 bat '''
                                     @echo off
 
-                                    "%DOCKER_EXE%" push "%IMAGE_LATEST%"
+                                    "%DOCKER_EXE%" --config "%DOCKER_CONFIG%" push "%IMAGE_LATEST%"
 
                                     if errorlevel 1 exit /b 1
                                 '''
 
-                                echo 'Docker images successfully pushed to ACR!'
-
-                                // CREATE KUBECONFIG DIRECTORY
-                                echo 'Preparing Kubernetes configuration...'
-
-                                bat '''
-                                    @echo off
-
-                                    if not exist "%WORKSPACE%\\.kube" (
-                                        mkdir "%WORKSPACE%\\.kube"
-                                    )
-                                '''
+                                echo 'Both Docker images pushed successfully!'
 
                                 // GET AKS CREDENTIALS
                                 echo 'Connecting to Azure Kubernetes Service...'
@@ -240,13 +251,13 @@ pipeline {
                                 ).trim()
 
                                 if (!containerName) {
-                                    error('Unable to identify Kubernetes container name.')
+                                    error('Unable to identify Kubernetes container.')
                                 }
 
                                 echo "Container identified: ${containerName}"
 
                                 // UPDATE KUBERNETES DEPLOYMENT
-                                echo 'Updating Kubernetes deployment...'
+                                echo 'Deploying the new image to AKS...'
 
                                 bat """
                                     @echo off
@@ -275,8 +286,8 @@ pipeline {
 
                                 echo 'Kubernetes rollout successful!'
 
-                                // FINAL DEPLOYMENT VERIFICATION
-                                echo 'Verifying deployed application...'
+                                // FINAL VERIFICATION
+                                echo 'Verifying deployment status...'
 
                                 bat '''
                                     @echo off
@@ -295,22 +306,24 @@ pipeline {
 
                             } finally {
 
-                                // CLEANUP DOCKER AUTHENTICATION
+                                // DOCKER LOGOUT USING ISOLATED CONFIG
                                 echo 'Cleaning up Docker credentials...'
 
                                 bat(
                                     returnStatus: true,
                                     script: '''
                                         @echo off
-                                        "%DOCKER_EXE%" logout "%ACR_LOGIN_SERVER%"
+
+                                        "%DOCKER_EXE%" --config "%DOCKER_CONFIG%" logout "%ACR_LOGIN_SERVER%"
                                     '''
                                 )
 
-                                // REMOVE TEMPORARY DOCKER CONFIG
+                                // REMOVE DOCKER CONFIG
                                 bat(
                                     returnStatus: true,
                                     script: '''
                                         @echo off
+
                                         if exist "%DOCKER_CONFIG%" rmdir /s /q "%DOCKER_CONFIG%"
                                     '''
                                 )
@@ -323,15 +336,37 @@ pipeline {
                                     script: '"%AZ_CLI%" logout'
                                 )
 
-                                // REMOVE TEMPORARY KUBERNETES CONFIG
+                                // REMOVE AZURE CONFIG
+                                bat(
+                                    returnStatus: true,
+                                    script: '''
+                                        @echo off
+
+                                        if exist "%AZURE_CONFIG_DIR%" rmdir /s /q "%AZURE_CONFIG_DIR%"
+                                    '''
+                                )
+
+                                // REMOVE KUBERNETES CONFIG
                                 echo 'Removing temporary Kubernetes credentials...'
 
                                 bat(
                                     returnStatus: true,
                                     script: '''
                                         @echo off
+
                                         if exist "%KUBECONFIG%" del /f /q "%KUBECONFIG%"
+
                                         if exist "%WORKSPACE%\\.kube" rmdir /s /q "%WORKSPACE%\\.kube"
+                                    '''
+                                )
+
+                                // REMOVE TEMPORARY LOGIN SCRIPT
+                                bat(
+                                    returnStatus: true,
+                                    script: '''
+                                        @echo off
+
+                                        if exist "%WORKSPACE%\\acr-login.ps1" del /f /q "%WORKSPACE%\\acr-login.ps1"
                                     '''
                                 )
                             }
@@ -342,26 +377,26 @@ pipeline {
         }
     }
 
-    // PIPELINE RESULT
+    // PIPELINE STATUS
     post {
 
         success {
             echo '''
             ==========================================
-                 CIA2 CI/CD PIPELINE SUCCESSFUL
+                  CIA2 CI/CD PIPELINE SUCCESSFUL
             ==========================================
 
-                 GitHub Checkout        : SUCCESS
-                 Java Environment       : SUCCESS
-                 Maven Build & Tests    : SUCCESS
-                 Docker Image Build     : SUCCESS
-                 Azure Authentication  : SUCCESS
-                 ACR Image Push         : SUCCESS
-                 AKS Deployment         : SUCCESS
-                 Deployment Verification: SUCCESS
+                  GitHub Checkout         : SUCCESS
+                  Java Environment        : SUCCESS
+                  Maven Build & Tests     : SUCCESS
+                  Docker Image Build      : SUCCESS
+                  Azure Authentication   : SUCCESS
+                  ACR Image Push          : SUCCESS
+                  Kubernetes Deployment  : SUCCESS
+                  Deployment Verification: SUCCESS
 
             ==========================================
-                 APPLICATION DEPLOYED ON AZURE AKS
+                  APPLICATION DEPLOYED ON AZURE AKS
             ==========================================
             '''
         }
@@ -369,11 +404,11 @@ pipeline {
         failure {
             echo '''
             ==========================================
-                 CIA2 CI/CD PIPELINE FAILED
+                  CIA2 CI/CD PIPELINE FAILED
             ==========================================
 
-                 Check Jenkins Console Output
-                 for the failed stage and error.
+                  Check Jenkins Console Output
+                  to identify the failed stage.
 
             ==========================================
             '''
