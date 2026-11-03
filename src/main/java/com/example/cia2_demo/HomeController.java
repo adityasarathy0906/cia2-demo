@@ -9,6 +9,6 @@ public class HomeController {
 
     @GetMapping("/")
     public String home() {
-        return "CIA2 CI/CD Pipeline deployed successfully on Azure Kubernetes Service!";
+        return "hi!";
     }
 }
