@@ -14,6 +14,13 @@ pipeline {
                 bat 'java -version'
             }
         }
+       stage('Check Docker') {
+             steps {
+                bat 'docker --version'
+                bat 'docker info'
+             }
+         }
+
 
         stage('Build and Test with Maven') {
             steps {
