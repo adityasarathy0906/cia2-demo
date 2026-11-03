@@ -110,13 +110,12 @@ pipeline {
 
                     withEnv([
                         "DOCKER_CONFIG=${env.WORKSPACE}\\.docker-ci",
-                        "AZURE_CONFIG_DIR=${env.WORKSPACE}\\.azure-ci",
-                        "KUBECONFIG=${env.WORKSPACE}\\.kube\\config"
+                        "AZURE_CONFIG_DIR=${env.WORKSPACE}\\.azure-ci"
                     ]) {
 
                         script {
 
-                            def kubeconfigPath =
+                            def workspaceKubeconfig =
                                 "${env.WORKSPACE}\\.kube\\config"
 
                             try {
@@ -166,7 +165,7 @@ pipeline {
                                 echo 'Azure authentication successful!'
 
                                 // ACR TOKEN AUTHENTICATION
-                                echo 'Obtaining ACR access token...'
+                                echo 'Obtaining ACR token...'
 
                                 writeFile file: 'acr-login.ps1', text: '''
 $ErrorActionPreference = "Stop"
@@ -205,7 +204,7 @@ Write-Output "ACR authentication successful."
 
                                 echo 'ACR authentication successful!'
 
-                                // PUSH VERSIONED DOCKER IMAGE
+                                // PUSH VERSIONED IMAGE
                                 echo 'Pushing versioned Docker image...'
 
                                 bat '''
@@ -216,7 +215,7 @@ Write-Output "ACR authentication successful."
                                     if errorlevel 1 exit /b 1
                                 '''
 
-                                // PUSH LATEST DOCKER IMAGE
+                                // PUSH LATEST IMAGE
                                 echo 'Pushing latest Docker image...'
 
                                 bat '''
@@ -227,7 +226,7 @@ Write-Output "ACR authentication successful."
                                     if errorlevel 1 exit /b 1
                                 '''
 
-                                echo 'Both Docker images pushed successfully!'
+                                echo 'Both images successfully pushed to ACR!'
 
                                 // RETRIEVE AKS CREDENTIALS
                                 echo 'Retrieving AKS credentials...'
@@ -240,79 +239,95 @@ Write-Output "ACR authentication successful."
                                     "%AZ_CLI%" aks get-credentials ^
                                     --resource-group "%AZURE_RESOURCE_GROUP%" ^
                                     --name "%AKS_NAME%" ^
-                                    --file "${kubeconfigPath}" ^
+                                    --file "${workspaceKubeconfig}" ^
                                     --overwrite-existing
 
                                     if errorlevel 1 exit /b 1
 
-                                    if not exist "${kubeconfigPath}" (
-                                        echo ERROR: Kubeconfig file not found.
+                                    if not exist "${workspaceKubeconfig}" (
+                                        echo ERROR: Kubeconfig was not generated.
                                         exit /b 1
                                     )
-
-                                    echo Kubeconfig created successfully.
                                 """
 
-                                // CREATE POWERSHELL KUBERNETES DEPLOYMENT SCRIPT
-                                echo 'Preparing Kubernetes deployment script...'
+                                // POWERSHELL KUBERNETES DEPLOYMENT SCRIPT
+                                echo 'Preparing Kubernetes deployment...'
 
                                 writeFile file: 'aks-deploy.ps1', text: '''
 $ErrorActionPreference = "Stop"
 
-$kubeconfig = Join-Path $env:WORKSPACE ".kube\\config"
 $kubectl = $env:KUBECTL_EXE
 
-Write-Output "Kubernetes configuration: $kubeconfig"
+# WORKSPACE KUBECONFIG
+$workspaceConfig = Join-Path $env:WORKSPACE ".kube\\config"
 
-if (-not (Test-Path -LiteralPath $kubeconfig)) {
-    Write-Error "Kubeconfig does not exist at the workspace path."
+# JENKINS SYSTEM ACCOUNT DEFAULT KUBECONFIG
+$defaultKubeDir = Join-Path $env:USERPROFILE ".kube"
+$defaultConfig = Join-Path $defaultKubeDir "config"
+
+Write-Output "Workspace kubeconfig: $workspaceConfig"
+Write-Output "Jenkins default kubeconfig: $defaultConfig"
+
+# VERIFY WORKSPACE CONFIGURATION
+if (-not (Test-Path -LiteralPath $workspaceConfig)) {
+    Write-Error "Workspace kubeconfig does not exist."
     exit 1
 }
 
-# Explicitly configure the Kubernetes credentials.
-$env:KUBECONFIG = $kubeconfig
+# CREATE THE SYSTEM ACCOUNT KUBE DIRECTORY
+if (-not (Test-Path -LiteralPath $defaultKubeDir)) {
+    New-Item -ItemType Directory -Path $defaultKubeDir -Force | Out-Null
+}
+
+# COPY CONFIGURATION TO THE DEFAULT LOCATION
+Copy-Item -LiteralPath $workspaceConfig -Destination $defaultConfig -Force
+
+if (-not (Test-Path -LiteralPath $defaultConfig)) {
+    Write-Error "Could not copy kubeconfig to Jenkins system profile."
+    exit 1
+}
+
+# SET KUBECONFIG EXPLICITLY
+$env:KUBECONFIG = $defaultConfig
+
+Write-Output "Using kubeconfig: $env:KUBECONFIG"
 
 # VERIFY KUBERNETES CONNECTION
 Write-Output "Checking AKS nodes..."
 
-& $kubectl --kubeconfig $kubeconfig get nodes
+& $kubectl --kubeconfig $defaultConfig get nodes
 
 if ($LASTEXITCODE -ne 0) {
-    Write-Error "Could not connect to AKS nodes."
+    Write-Error "AKS node verification failed."
     exit 1
 }
 
-# IDENTIFY DEPLOYMENT CONTAINER
-Write-Output "Identifying deployment container..."
+# IDENTIFY CONTAINER
+Write-Output "Identifying Kubernetes container..."
 
-$containerName = (& $kubectl --kubeconfig $kubeconfig get deployment $env:DEPLOYMENT_NAME -o 'jsonpath={.spec.template.spec.containers[0].name}' | Out-String).Trim()
+$containerName = (& $kubectl --kubeconfig $defaultConfig get deployment $env:DEPLOYMENT_NAME -o 'jsonpath={.spec.template.spec.containers[0].name}' | Out-String).Trim()
 
-if ($LASTEXITCODE -ne 0) {
-    Write-Error "Could not read deployment details."
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($containerName)) {
+    Write-Error "Could not identify deployment container."
     exit 1
 }
 
-if ([string]::IsNullOrWhiteSpace($containerName)) {
-    Write-Error "Container name could not be identified."
-    exit 1
-}
-
-Write-Output "Container: $containerName"
+Write-Output "Container identified: $containerName"
 
 # UPDATE DEPLOYMENT IMAGE
 Write-Output "Updating Kubernetes deployment..."
 
-& $kubectl --kubeconfig $kubeconfig set image "deployment/$($env:DEPLOYMENT_NAME)" "$($containerName)=$($env:IMAGE_URI)"
+& $kubectl --kubeconfig $defaultConfig set image "deployment/$($env:DEPLOYMENT_NAME)" "$($containerName)=$($env:IMAGE_URI)"
 
 if ($LASTEXITCODE -ne 0) {
-    Write-Error "Kubernetes image update failed."
+    Write-Error "Deployment image update failed."
     exit 1
 }
 
 # VERIFY ROLLOUT
-Write-Output "Waiting for deployment rollout..."
+Write-Output "Waiting for Kubernetes rollout..."
 
-& $kubectl --kubeconfig $kubeconfig rollout status "deployment/$($env:DEPLOYMENT_NAME)" --timeout=180s
+& $kubectl --kubeconfig $defaultConfig rollout status "deployment/$($env:DEPLOYMENT_NAME)" --timeout=180s
 
 if ($LASTEXITCODE -ne 0) {
     Write-Error "Kubernetes rollout failed."
@@ -322,23 +337,23 @@ if ($LASTEXITCODE -ne 0) {
 # FINAL VERIFICATION
 Write-Output "===== DEPLOYMENTS ====="
 
-& $kubectl --kubeconfig $kubeconfig get deployments
+& $kubectl --kubeconfig $defaultConfig get deployments
 
 if ($LASTEXITCODE -ne 0) { exit 1 }
 
 Write-Output "===== PODS ====="
 
-& $kubectl --kubeconfig $kubeconfig get pods -o wide
+& $kubectl --kubeconfig $defaultConfig get pods -o wide
 
 if ($LASTEXITCODE -ne 0) { exit 1 }
 
 Write-Output "===== SERVICES ====="
 
-& $kubectl --kubeconfig $kubeconfig get services
+& $kubectl --kubeconfig $defaultConfig get services
 
 if ($LASTEXITCODE -ne 0) { exit 1 }
 
-Write-Output "Kubernetes deployment and verification successful!"
+Write-Output "Kubernetes deployment successful!"
 '''
 
                                 // RUN KUBERNETES SCRIPT
@@ -381,9 +396,7 @@ Write-Output "Kubernetes deployment and verification successful!"
                                     script: '"%AZ_CLI%" logout'
                                 )
 
-                                // REMOVE TEMPORARY AZURE CONFIG
-                                echo 'Removing temporary Azure configuration...'
-
+                                // REMOVE AZURE CONFIG
                                 bat(
                                     returnStatus: true,
                                     script: '''
@@ -393,21 +406,29 @@ Write-Output "Kubernetes deployment and verification successful!"
                                     '''
                                 )
 
-                                // REMOVE KUBERNETES CONFIG
-                                echo 'Removing temporary Kubernetes credentials...'
-
+                                // REMOVE WORKSPACE KUBECONFIG
                                 bat(
                                     returnStatus: true,
                                     script: """
                                         @echo off
 
-                                        if exist "${kubeconfigPath}" del /f /q "${kubeconfigPath}"
+                                        if exist "${workspaceKubeconfig}" del /f /q "${workspaceKubeconfig}"
 
                                         if exist "%WORKSPACE%\\.kube" rmdir /s /q "%WORKSPACE%\\.kube"
                                     """
                                 )
 
-                                // REMOVE TEMPORARY POWERSHELL SCRIPTS
+                                // REMOVE SYSTEM PROFILE KUBECONFIG
+                                bat(
+                                    returnStatus: true,
+                                    script: '''
+                                        @echo off
+
+                                        powershell.exe -NoProfile -NonInteractive -Command "$p=Join-Path $env:USERPROFILE '.kube\\config'; if(Test-Path -LiteralPath $p){Remove-Item -LiteralPath $p -Force}"
+                                    '''
+                                )
+
+                                // REMOVE TEMPORARY POWERSHELL FILES
                                 bat(
                                     returnStatus: true,
                                     script: '''
@@ -426,7 +447,7 @@ Write-Output "Kubernetes deployment and verification successful!"
         }
     }
 
-    // PIPELINE RESULT
+    // PIPELINE STATUS
     post {
 
         success {
