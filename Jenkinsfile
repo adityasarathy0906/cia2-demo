@@ -110,12 +110,12 @@ pipeline {
 
                     withEnv([
                         "DOCKER_CONFIG=${env.WORKSPACE}\\.docker-ci",
-                        "AZURE_CONFIG_DIR=${env.WORKSPACE}\\.azure-ci"
+                        "AZURE_CONFIG_DIR=${env.WORKSPACE}\\.azure-ci",
+                        "KUBECONFIG=${env.WORKSPACE}\\.kube\\config"
                     ]) {
 
                         script {
 
-                            // DIRECT ABSOLUTE KUBECONFIG PATH
                             def kubeconfigPath =
                                 "${env.WORKSPACE}\\.kube\\config"
 
@@ -139,7 +139,7 @@ pipeline {
                                 // DISABLE AZURE TELEMETRY
                                 writeFile(
                                     file: '.azure-ci/config',
-                                    text: "[core]\ncollect_telemetry=no\n"
+                                    text: '[core]\ncollect_telemetry=no\n'
                                 )
 
                                 // AZURE AUTHENTICATION
@@ -165,7 +165,7 @@ pipeline {
 
                                 echo 'Azure authentication successful!'
 
-                                // ACR AUTHENTICATION WITHOUT WINCRED
+                                // ACR TOKEN AUTHENTICATION
                                 echo 'Obtaining ACR access token...'
 
                                 writeFile file: 'acr-login.ps1', text: '''
@@ -205,7 +205,7 @@ Write-Output "ACR authentication successful."
 
                                 echo 'ACR authentication successful!'
 
-                                // PUSH VERSIONED IMAGE
+                                // PUSH VERSIONED DOCKER IMAGE
                                 echo 'Pushing versioned Docker image...'
 
                                 bat '''
@@ -216,7 +216,7 @@ Write-Output "ACR authentication successful."
                                     if errorlevel 1 exit /b 1
                                 '''
 
-                                // PUSH LATEST IMAGE
+                                // PUSH LATEST DOCKER IMAGE
                                 echo 'Pushing latest Docker image...'
 
                                 bat '''
@@ -227,15 +227,15 @@ Write-Output "ACR authentication successful."
                                     if errorlevel 1 exit /b 1
                                 '''
 
-                                echo 'Both images successfully pushed to ACR!'
+                                echo 'Both Docker images pushed successfully!'
 
-                                // GET AKS CREDENTIALS
-                                echo 'Connecting to Azure Kubernetes Service...'
-
-                                echo "Kubeconfig location: ${kubeconfigPath}"
+                                // RETRIEVE AKS CREDENTIALS
+                                echo 'Retrieving AKS credentials...'
 
                                 bat """
                                     @echo off
+
+                                    if not exist "%WORKSPACE%\\.kube" mkdir "%WORKSPACE%\\.kube"
 
                                     "%AZ_CLI%" aks get-credentials ^
                                     --resource-group "%AZURE_RESOURCE_GROUP%" ^
@@ -246,87 +246,111 @@ Write-Output "ACR authentication successful."
                                     if errorlevel 1 exit /b 1
 
                                     if not exist "${kubeconfigPath}" (
-                                        echo ERROR: Kubeconfig file missing.
+                                        echo ERROR: Kubeconfig file not found.
                                         exit /b 1
                                     )
 
-                                    echo Testing Kubernetes connection...
-
-                                    "%KUBECTL_EXE%" --kubeconfig "${kubeconfigPath}" get nodes
-
-                                    if errorlevel 1 exit /b 1
+                                    echo Kubeconfig created successfully.
                                 """
 
-                                echo 'Successfully connected to AKS!'
+                                // CREATE POWERSHELL KUBERNETES DEPLOYMENT SCRIPT
+                                echo 'Preparing Kubernetes deployment script...'
 
-                                // IDENTIFY DEPLOYMENT CONTAINER
-                                echo 'Identifying Kubernetes container...'
+                                writeFile file: 'aks-deploy.ps1', text: '''
+$ErrorActionPreference = "Stop"
 
-                                def containerName = bat(
-                                    returnStdout: true,
-                                    script: """
-                                        @echo off
+$kubeconfig = Join-Path $env:WORKSPACE ".kube\\config"
+$kubectl = $env:KUBECTL_EXE
 
-                                        "%KUBECTL_EXE%" --kubeconfig "${kubeconfigPath}" get deployment "%DEPLOYMENT_NAME%" -o "jsonpath={.spec.template.spec.containers[0].name}"
-                                    """
-                                ).trim()
+Write-Output "Kubernetes configuration: $kubeconfig"
 
-                                if (!containerName) {
-                                    error('Could not identify Kubernetes container.')
-                                }
+if (-not (Test-Path -LiteralPath $kubeconfig)) {
+    Write-Error "Kubeconfig does not exist at the workspace path."
+    exit 1
+}
 
-                                echo "Container identified: ${containerName}"
+# Explicitly configure the Kubernetes credentials.
+$env:KUBECONFIG = $kubeconfig
 
-                                // UPDATE KUBERNETES DEPLOYMENT
-                                echo 'Updating Kubernetes deployment...'
+# VERIFY KUBERNETES CONNECTION
+Write-Output "Checking AKS nodes..."
 
-                                bat """
+& $kubectl --kubeconfig $kubeconfig get nodes
+
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "Could not connect to AKS nodes."
+    exit 1
+}
+
+# IDENTIFY DEPLOYMENT CONTAINER
+Write-Output "Identifying deployment container..."
+
+$containerName = (& $kubectl --kubeconfig $kubeconfig get deployment $env:DEPLOYMENT_NAME -o 'jsonpath={.spec.template.spec.containers[0].name}' | Out-String).Trim()
+
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "Could not read deployment details."
+    exit 1
+}
+
+if ([string]::IsNullOrWhiteSpace($containerName)) {
+    Write-Error "Container name could not be identified."
+    exit 1
+}
+
+Write-Output "Container: $containerName"
+
+# UPDATE DEPLOYMENT IMAGE
+Write-Output "Updating Kubernetes deployment..."
+
+& $kubectl --kubeconfig $kubeconfig set image "deployment/$($env:DEPLOYMENT_NAME)" "$($containerName)=$($env:IMAGE_URI)"
+
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "Kubernetes image update failed."
+    exit 1
+}
+
+# VERIFY ROLLOUT
+Write-Output "Waiting for deployment rollout..."
+
+& $kubectl --kubeconfig $kubeconfig rollout status "deployment/$($env:DEPLOYMENT_NAME)" --timeout=180s
+
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "Kubernetes rollout failed."
+    exit 1
+}
+
+# FINAL VERIFICATION
+Write-Output "===== DEPLOYMENTS ====="
+
+& $kubectl --kubeconfig $kubeconfig get deployments
+
+if ($LASTEXITCODE -ne 0) { exit 1 }
+
+Write-Output "===== PODS ====="
+
+& $kubectl --kubeconfig $kubeconfig get pods -o wide
+
+if ($LASTEXITCODE -ne 0) { exit 1 }
+
+Write-Output "===== SERVICES ====="
+
+& $kubectl --kubeconfig $kubeconfig get services
+
+if ($LASTEXITCODE -ne 0) { exit 1 }
+
+Write-Output "Kubernetes deployment and verification successful!"
+'''
+
+                                // RUN KUBERNETES SCRIPT
+                                echo 'Connecting to AKS and deploying application...'
+
+                                bat '''
                                     @echo off
 
-                                    "%KUBECTL_EXE%" --kubeconfig "${kubeconfigPath}" set image ^
-                                    deployment/%DEPLOYMENT_NAME% ^
-                                    "${containerName}=%IMAGE_URI%"
+                                    powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%WORKSPACE%\\aks-deploy.ps1"
 
                                     if errorlevel 1 exit /b 1
-                                """
-
-                                echo 'Kubernetes deployment updated!'
-
-                                // VERIFY ROLLOUT
-                                echo 'Waiting for Kubernetes rollout...'
-
-                                bat """
-                                    @echo off
-
-                                    "%KUBECTL_EXE%" --kubeconfig "${kubeconfigPath}" rollout status ^
-                                    deployment/%DEPLOYMENT_NAME% ^
-                                    --timeout=180s
-
-                                    if errorlevel 1 exit /b 1
-                                """
-
-                                echo 'Kubernetes rollout successful!'
-
-                                // FINAL DEPLOYMENT VERIFICATION
-                                echo 'Verifying application deployment...'
-
-                                bat """
-                                    @echo off
-
-                                    echo ===== DEPLOYMENTS =====
-
-                                    "%KUBECTL_EXE%" --kubeconfig "${kubeconfigPath}" get deployments
-
-                                    echo ===== PODS =====
-
-                                    "%KUBECTL_EXE%" --kubeconfig "${kubeconfigPath}" get pods -o wide
-
-                                    echo ===== SERVICES =====
-
-                                    "%KUBECTL_EXE%" --kubeconfig "${kubeconfigPath}" get services
-
-                                    if errorlevel 1 exit /b 1
-                                """
+                                '''
 
                                 echo 'Application successfully deployed on Azure AKS!'
 
@@ -340,12 +364,11 @@ Write-Output "ACR authentication successful."
                                     script: '"%DOCKER_EXE%" --config "%DOCKER_CONFIG%" logout "%ACR_LOGIN_SERVER%"'
                                 )
 
-                                // DELETE DOCKER CONFIG
+                                // REMOVE DOCKER CONFIG
                                 bat(
                                     returnStatus: true,
                                     script: '''
                                         @echo off
-
                                         if exist "%DOCKER_CONFIG%" rmdir /s /q "%DOCKER_CONFIG%"
                                     '''
                                 )
@@ -358,7 +381,7 @@ Write-Output "ACR authentication successful."
                                     script: '"%AZ_CLI%" logout'
                                 )
 
-                                // REMOVE AZURE CONFIG
+                                // REMOVE TEMPORARY AZURE CONFIG
                                 echo 'Removing temporary Azure configuration...'
 
                                 bat(
@@ -384,13 +407,15 @@ Write-Output "ACR authentication successful."
                                     """
                                 )
 
-                                // REMOVE TEMPORARY POWERSHELL SCRIPT
+                                // REMOVE TEMPORARY POWERSHELL SCRIPTS
                                 bat(
                                     returnStatus: true,
                                     script: '''
                                         @echo off
 
                                         if exist "%WORKSPACE%\\acr-login.ps1" del /f /q "%WORKSPACE%\\acr-login.ps1"
+
+                                        if exist "%WORKSPACE%\\aks-deploy.ps1" del /f /q "%WORKSPACE%\\aks-deploy.ps1"
                                     '''
                                 )
                             }
@@ -418,7 +443,7 @@ Write-Output "ACR authentication successful."
                  ACR Image Push         : SUCCESS
                  AKS Connection         : SUCCESS
                  Kubernetes Deployment : SUCCESS
-                 Rollout Verification  : SUCCESS
+                 Rollout Verification   : SUCCESS
 
             ==========================================
                  APPLICATION DEPLOYED ON AZURE AKS
@@ -433,7 +458,7 @@ Write-Output "ACR authentication successful."
             ==========================================
 
                  Check Jenkins Console Output
-                 for the failed stage.
+                 to identify the failed stage.
 
             ==========================================
             '''
