@@ -262,7 +262,7 @@ $kubectl = $env
 
 WORKSPACE KUBECONFIG
 
-$workspaceConfig = Join-Path $env ".kube\config"
+$workspaceConfig = Join-Path $env:WORKSPACE ".kube\\config"
 
 JENKINS SYSTEM ACCOUNT DEFAULT KUBECONFIG
 
